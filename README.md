@@ -65,8 +65,11 @@ NTRIP 1.0 client.
 
 `-w` and `-c` take a range as defined by the
 [monitoring plugins guidelines](https://www.monitoring-plugins.org/doc/guidelines.html#THRESHOLDFORMAT):
-`10` alerts outside 0..10, `10:` below 10, `~:10` above 10, `10:20` outside
+`10` alerts outside 0..10, `10:` below 10, `'~:10'` above 10, `10:20` outside
 10..20, and `@10:20` inside 10..20.
+
+Quote a range with `~` on the command line, as shown: bash expands an
+unquoted `~:10` to your home directory followed by `:10`.
 
 ## Output and exit codes
 
