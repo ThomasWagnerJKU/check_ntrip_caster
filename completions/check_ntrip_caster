@@ -1,0 +1,51 @@
+# bash completion for check_ntrip_caster                     -*- shell-script -*-
+
+_check_ntrip_caster()
+{
+    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
+    # --option=value: bash splits at the =
+    if [[ $cur == = ]]; then
+        cur=
+    elif [[ $prev == = && $COMP_CWORD -ge 2 ]]; then
+        prev=${COMP_WORDS[COMP_CWORD-2]}
+    fi
+    COMPREPLY=()
+
+    # the mode is the first word that is no option, before it come only -h and -V
+    local i mode=
+    for ((i = 1; i < COMP_CWORD; i++)); do
+        if [[ ${COMP_WORDS[i]} != -* ]]; then
+            mode=${COMP_WORDS[i]}
+            break
+        fi
+    done
+    if [[ -z $mode ]]; then
+        mapfile -t COMPREPLY < <(compgen -W '-h --help -V --version sourcetable stream' -- "$cur")
+        return
+    fi
+
+    case $prev in
+        -H | --hostname)
+            mapfile -t COMPREPLY < <(compgen -A hostname -- "$cur")
+            return
+            ;;
+        -f | --password-file)
+            compopt -o filenames 2>/dev/null
+            mapfile -t COMPREPLY < <(compgen -f -- "$cur")
+            return
+            ;;
+        -p | --port | -t | --timeout | -w | --warning | -c | --critical | -m | --mountpoint | \
+            -u | --username | -P | --password | -d | --duration | --leap-seconds)
+            return
+            ;;
+    esac
+
+    local options='-h --help -H --hostname -p --port -t --timeout -w --warning
+        -c --critical -m --mountpoint'
+    if [[ $mode == stream ]]; then
+        options+=' -u --username -P --password -f --password-file -d --duration
+            --leap-seconds'
+    fi
+    mapfile -t COMPREPLY < <(compgen -W "$options" -- "$cur")
+}
+complete -F _check_ntrip_caster check_ntrip_caster

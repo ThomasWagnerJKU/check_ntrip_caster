@@ -79,6 +79,22 @@ CRITICAL; rejected credentials and a wrong command line are UNKNOWN.
 
 The plugin speaks NTRIP 1.0, which every caster supports.
 
+## Bash completion
+
+`completions/check_ntrip_caster` completes the modes, the options and their
+values, also when the plugin is called by its full path. The packages install
+it; otherwise copy it to bash-completion's directory:
+
+```sh
+install -D -m 0644 completions/check_ntrip_caster /usr/share/bash-completion/completions/check_ntrip_caster
+```
+
+## Tests
+
+```sh
+python3 -m unittest -v
+```
+
 ## License
 
 GPL-2.0-or-later, see [LICENSE](LICENSE).
