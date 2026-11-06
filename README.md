@@ -51,6 +51,35 @@ a caster that closes the stream early are WARNINGs. A stream without any
 observation message, for example only station coordinates, is UNKNOWN, as its
 age cannot be told.
 
+### Content of the stream
+
+The stream mode also looks at what the data says. It always reports, and puts
+into the performance data:
+
+- the satellites per constellation of the newest complete epoch, from the MSM
+  messages (all MSM1-7) and the legacy messages 1001-1004 and 1009-1012
+  (`satellites_gps`, `satellites_glonass`, ...)
+- the mean C/N0 of all signals in the MSM4 to MSM7 messages (`cnr`, in dBHz).
+  A falling C/N0 is the typical sign of an aging antenna or cable.
+
+These options turn them into alerts:
+
+| Option | Alert |
+|---|---|
+| `--require-messages 1005,1077,1087,1230` | CRITICAL when one of these message types does not arrive within the read time |
+| `--position LAT,LON,HEIGHT` | CRITICAL when the antenna reference point in 1005/1006 is more than `--position-tolerance` metres (default 0.05) away from this WGS84 position; WARNING when no 1005/1006 arrives |
+| `--satellites-warning GPS=8,GLONASS=4`, `--satellites-critical GPS=5,GLONASS=2` | below this many satellites of a constellation; a constellation that sends nothing counts 0 |
+| `--cnr-warning 35`, `--cnr-critical 30` | mean C/N0 below this; WARNING when the stream has no MSM4 to MSM7 message |
+
+Stations send 1005/1006 only every few seconds, often every 10 s: read long
+enough with `-d` (for example `-d 12`) when you require it or check the
+position. The position is compared in earth-centred coordinates, so the
+height is the ellipsoidal height, as RTCM carries it.
+
+```
+NTRIP STREAM CRITICAL - station position 0.732m away from 48.3359715,14.3226885,324.978 (tolerance 0.05m); only 2 GLONASS satellite(s); mean C/N0 32.9dBHz, JKU0: newest epoch 0.02s old (GPS), 73 RTCM3 frames in 12.0s, messages 1005 1074 1077 1084 1087 1230, position 0.732m off, satellites GLONASS 2 GPS 10, C/N0 32.9dBHz | age=0.019s;3;10 frames=73;;;0 bytes=5055B;;;0 crc_errors=0;;;0 first_frame=0.007s;;;0 position_error=0.732m;;0.05;0 satellites_glonass=2;4;2;0 satellites_gps=10;8;5;0 cnr=32.9dBHz;35;30;0
+```
+
 ## Credentials
 
 Pass the user name with `-u`. Never pass the password with `-P` in a service

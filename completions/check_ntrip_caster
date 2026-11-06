@@ -35,7 +35,18 @@ _check_ntrip_caster()
             return
             ;;
         -p | --port | -t | --timeout | -w | --warning | -c | --critical | -m | --mountpoint | \
-            -u | --username | -P | --password | -d | --duration | --leap-seconds)
+            -u | --username | -P | --password | -d | --duration | --leap-seconds | \
+            --require-messages | --position | --position-tolerance | --cnr-warning | --cnr-critical)
+            return
+            ;;
+        --satellites-warning | --satellites-critical)
+            # SYSTEM=COUNT,...: offer the constellations for the item being typed
+            local head=${cur%,*} item=${cur##*,} system
+            [[ $head == "$cur" ]] && head= || head+=,
+            for system in GPS GLONASS Galileo BeiDou QZSS SBAS NavIC; do
+                [[ $system == "$item"* ]] && COMPREPLY+=("$head$system=")
+            done
+            compopt -o nospace 2>/dev/null
             return
             ;;
     esac
@@ -44,7 +55,8 @@ _check_ntrip_caster()
         -c --critical -m --mountpoint'
     if [[ $mode == stream ]]; then
         options+=' -u --username -P --password -f --password-file -d --duration
-            --leap-seconds'
+            --leap-seconds --require-messages --position --position-tolerance
+            --satellites-warning --satellites-critical --cnr-warning --cnr-critical'
     fi
     mapfile -t COMPREPLY < <(compgen -W "$options" -- "$cur")
 }

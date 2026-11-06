@@ -8,6 +8,7 @@ import argparse
 import base64
 import datetime
 import email.utils
+import math
 import os
 import socket
 import sys
@@ -20,11 +21,12 @@ UNKNOWN = 3
 
 STATE_TEXT = {OK: "OK", WARNING: "WARNING", CRITICAL: "CRITICAL", UNKNOWN: "UNKNOWN"}
 
-VERSION = "0.2"
+VERSION = "0.3"
 DEFAULT_PORT = 2101
 DEFAULT_TIMEOUT = 10
 DEFAULT_DURATION = 5
 DEFAULT_LEAP_SECONDS = 18
+DEFAULT_POSITION_TOLERANCE = 0.05
 USER_AGENT = "NTRIP check_ntrip_caster/%s" % VERSION
 
 GPS_EPOCH_UNIX = 315964800
@@ -44,6 +46,24 @@ EPOCH_TOW = {"GPS": _types((1001, 1004), (1071, 1077)), "Galileo": _types((1091,
 EPOCH_BEIDOU = _types((1121, 1127))
 EPOCH_GLONASS_MSM = _types((1081, 1087))
 EPOCH_GLONASS_LEGACY = _types((1009, 1012))
+
+# First message type of the MSM1..MSM7 block of each constellation.
+MSM_BASE = {1070: "GPS", 1080: "GLONASS", 1090: "Galileo", 1100: "SBAS", 1110: "QZSS", 1120: "BeiDou",
+            1130: "NavIC"}
+SYSTEMS = {name.lower(): name for name in MSM_BASE.values()}
+
+# Legacy observation messages: bit position of the 5 bit satellite count and of the synchronous GNSS flag.
+LEGACY_SATELLITES = {**{t: ("GPS", 55, 54) for t in range(1001, 1005)},
+                     **{t: ("GLONASS", 52, 51) for t in range(1009, 1013)}}
+
+# MSM header up to the satellite mask, the satellite data bits per satellite, and for the signal data
+# the bits before the C/N0 field, the width of that field and its resolution in dBHz.
+MSM_HEADER_BITS = 169
+MSM_SATELLITE_BITS = {4: 18, 5: 36, 6: 18, 7: 36}
+MSM_CNR = {4: (42, 6, 1.0), 5: (42, 6, 1.0), 6: (55, 10, 0.0625), 7: (55, 10, 0.0625)}
+
+WGS84_A = 6378137.0
+WGS84_F = 1 / 298.257223563
 
 
 class PluginError(Exception):
@@ -332,8 +352,90 @@ def epoch_age(message_type, payload, now, leap_seconds):
     return None
 
 
+def signed_bits(payload, position, count):
+    value = bits(payload, position, count)
+    return value - (1 << count) if value >> (count - 1) else value
+
+
+def ecef(latitude, longitude, height):
+    """WGS84 geodetic coordinates in degrees and metres to earth-centred X, Y, Z in metres."""
+    lat, lon = math.radians(latitude), math.radians(longitude)
+    e2 = WGS84_F * (2 - WGS84_F)
+    n = WGS84_A / math.sqrt(1 - e2 * math.sin(lat) ** 2)
+    return ((n + height) * math.cos(lat) * math.cos(lon), (n + height) * math.cos(lat) * math.sin(lon),
+            (n * (1 - e2) + height) * math.sin(lat))
+
+
+class StreamContent:
+    """What the messages of a stream tell about its data: station position, satellites and C/N0."""
+
+    def __init__(self):
+        self.position = None
+        # (system, epoch) -> [satellites, complete]; legacy messages give a count, MSM a set of PRNs
+        self.epochs = {}
+        self.cnr = {}
+
+    def add(self, message_type, payload):
+        size = len(payload) * 8
+        if message_type in (1005, 1006) and size >= 152:
+            self.position = tuple(signed_bits(payload, start, 38) * 0.0001 for start in (34, 74, 114))
+        elif message_type in LEGACY_SATELLITES:
+            system, count_bit, sync_bit = LEGACY_SATELLITES[message_type]
+            if size >= count_bit + 5:
+                # the epoch is the 30 bit TOW (GPS) or 27 bit time of day (GLONASS) just before the sync flag
+                epoch = bits(payload, 24, sync_bit - 24)
+                entry = self.epochs.setdefault((system, epoch), [0, False])
+                # MSM and legacy messages of one epoch: keep the MSM satellite set
+                if isinstance(entry[0], int):
+                    entry[0] += bits(payload, count_bit, 5)
+                entry[1] = not bits(payload, sync_bit, 1)
+        elif message_type - message_type % 10 in MSM_BASE and 1 <= message_type % 10 <= 7:
+            self._add_msm(MSM_BASE[message_type - message_type % 10], message_type % 10, payload, size)
+
+    def _add_msm(self, system, kind, payload, size):
+        if size < MSM_HEADER_BITS:
+            return
+        satellite_mask = bits(payload, 73, 64)
+        satellites = {prn for prn in range(1, 65) if satellite_mask >> (64 - prn) & 1}
+        nsat, nsig = len(satellites), bin(bits(payload, 137, 32)).count("1")
+        if size < MSM_HEADER_BITS + nsat * nsig:
+            return
+        cells = bin(bits(payload, MSM_HEADER_BITS, nsat * nsig)).count("1") if nsat * nsig else 0
+        # a GPS-type TOW, or for GLONASS 3 bit day of week + 27 bit time of day; then the multiple message bit
+        entry = self.epochs.setdefault((system, bits(payload, 24, 30)), [set(), False])
+        if isinstance(entry[0], int):
+            entry[0] = set()
+        entry[0] |= satellites
+        entry[1] = not bits(payload, 54, 1)
+
+        if kind not in MSM_CNR:
+            return
+        before, width, resolution = MSM_CNR[kind]
+        # signal data is grouped by field: all cells' fine pseudorange, then all cells' phase range, ...
+        start = MSM_HEADER_BITS + nsat * nsig + nsat * MSM_SATELLITE_BITS[kind] + cells * before
+        if size < start + cells * width:
+            return
+        values = [bits(payload, start + index * width, width) * resolution for index in range(cells)]
+        self.cnr.setdefault(system, []).extend(value for value in values if value > 0)
+
+    def satellites(self):
+        """Satellites per constellation in its newest complete epoch, or its newest epoch if none is complete."""
+        newest = {}
+        for (system, epoch), (seen, complete) in self.epochs.items():
+            count = len(seen) if isinstance(seen, set) else seen
+            rank = (complete, epoch)
+            if system not in newest or rank > newest[system][0]:
+                newest[system] = (rank, count)
+        return {system: count for system, (_, count) in newest.items()}
+
+    def mean_cnr(self):
+        values = [value for system in self.cnr.values() for value in system]
+        return sum(values) / len(values) if values else None
+
+
 def check_stream(args):
     connection = Connection(args, args.mountpoint, authenticate=True)
+    content = StreamContent()
     types = {}
     frames = crc_errors = 0
     newest = None
@@ -382,6 +484,7 @@ def check_stream(args):
             if length >= 2:
                 message_type = bits(payload, 0, 12)
                 types[message_type] = types.get(message_type, 0) + 1
+                content.add(message_type, payload)
                 if length >= 8:
                     age = epoch_age(message_type, payload, time.time(), args.leap_seconds)
                     if age is not None and (newest is None or abs(age[0]) < abs(newest[0])):
@@ -417,11 +520,106 @@ def check_stream(args):
         state = max(state, WARNING)
         problems.append("caster closed the stream after %.1fs" % listened)
 
+    details = []
+    content_state, content_problems = check_content(args, content, types, perf, details)
+    state = max(state, content_state)
+    problems += content_problems
+
     message = "%s: newest epoch %.2fs old (%s), %s" % (args.mountpoint, age, system, summary)
+    if details:
+        message += ", " + ", ".join(details)
     if problems:
         message = "; ".join(problems) + ", " + message
     perf.insert(0, perfdata("age", round(age, 3), "s", args.warning, args.critical))
     return state, message, perf
+
+
+def check_content(args, content, types, perf, details):
+    """Checks of what the stream says; adds perfdata and summary details, returns state and problems."""
+    state = OK
+    problems = []
+
+    missing = [t for t in args.require_messages or [] if t not in types]
+    if missing:
+        state = CRITICAL
+        problems.append("message(s) %s missing" % " ".join(str(t) for t in missing))
+
+    if args.position:
+        if content.position is None:
+            state = max(state, WARNING)
+            problems.append("no station position (1005/1006) within the read time")
+        else:
+            error = math.dist(content.position, ecef(*args.position))
+            details.append("position %.3fm off" % error)
+            perf.append(perfdata("position_error", round(error, 4), "m", None,
+                                 Range.parse(format_number(args.position_tolerance)), 0))
+            if error > args.position_tolerance:
+                state = CRITICAL
+                problems.append("station position %.3fm away from %s (tolerance %gm)"
+                                % (error, ",".join("%s" % v for v in args.position), args.position_tolerance))
+
+    satellites = content.satellites()
+    if satellites:
+        details.append("satellites %s" % " ".join("%s %d" % item for item in sorted(satellites.items())))
+    warning, critical = args.satellites_warning or {}, args.satellites_critical or {}
+    for name in sorted(set(satellites) | set(warning) | set(critical)):
+        count = satellites.get(name, 0)
+        warn = Range.parse("%d:" % warning[name]) if name in warning else None
+        crit = Range.parse("%d:" % critical[name]) if name in critical else None
+        perf.append(perfdata("satellites_%s" % name.lower(), count, "", warn, crit, 0))
+        if crit and crit.breached(count):
+            state = CRITICAL
+        elif warn and warn.breached(count):
+            state = max(state, WARNING)
+        else:
+            continue
+        problems.append("only %d %s satellite(s)" % (count, name))
+
+    cnr = content.mean_cnr()
+    warn = Range.parse("%g:" % args.cnr_warning) if args.cnr_warning is not None else None
+    crit = Range.parse("%g:" % args.cnr_critical) if args.cnr_critical is not None else None
+    if cnr is None:
+        if warn or crit:
+            state = max(state, WARNING)
+            problems.append("no C/N0 in the stream (needs MSM4 to MSM7 messages)")
+    else:
+        details.append("C/N0 %.1fdBHz" % cnr)
+        perf.append(perfdata("cnr", round(cnr, 1), "dBHz", warn, crit, 0))
+        if (crit and crit.breached(cnr)) or (warn and warn.breached(cnr)):
+            state = max(state, CRITICAL if crit and crit.breached(cnr) else WARNING)
+            problems.append("mean C/N0 %.1fdBHz" % cnr)
+
+    return state, problems
+
+
+def message_list(text):
+    try:
+        return [int(item) for item in text.replace(" ", ",").split(",") if item]
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected message numbers like 1005,1077, got %r" % text)
+
+
+def position(text):
+    try:
+        values = [float(item) for item in text.replace(" ", ",").split(",") if item]
+    except ValueError:
+        values = []
+    if len(values) != 3 or not (-90 <= values[0] <= 90 and -180 <= values[1] <= 360):
+        raise argparse.ArgumentTypeError("expected LATITUDE,LONGITUDE,HEIGHT in degrees and metres, got %r" % text)
+    return tuple(values)
+
+
+def satellite_counts(text):
+    counts = {}
+    for item in text.replace(" ", ",").split(","):
+        if not item:
+            continue
+        name, _, count = item.partition("=")
+        if name.lower() not in SYSTEMS or not count.isdigit():
+            raise argparse.ArgumentTypeError("expected SYSTEM=COUNT with SYSTEM one of %s, got %r"
+                                             % (", ".join(sorted(SYSTEMS.values())), item))
+        counts[SYSTEMS[name.lower()]] = int(count)
+    return counts
 
 
 MODES = {
@@ -478,6 +676,23 @@ def build_parser():
                         help="seconds to read the stream (default: %d)" % DEFAULT_DURATION)
     stream.add_argument("--leap-seconds", type=int, default=DEFAULT_LEAP_SECONDS,
                         help="GPS minus UTC in seconds (default: %d)" % DEFAULT_LEAP_SECONDS)
+    stream.add_argument("--require-messages", type=message_list, metavar="TYPES",
+                        help="comma separated message types that must arrive within the read time, "
+                             "CRITICAL otherwise")
+    stream.add_argument("--position", type=position, metavar="LAT,LON,HEIGHT",
+                        help="expected antenna reference point of the station (WGS84 degrees, ellipsoidal "
+                             "height in metres), compared with the 1005/1006 message")
+    stream.add_argument("--position-tolerance", type=float, default=DEFAULT_POSITION_TOLERANCE, metavar="METRES",
+                        help="CRITICAL when the station position is further off (default: %g)"
+                             % DEFAULT_POSITION_TOLERANCE)
+    stream.add_argument("--satellites-warning", type=satellite_counts, metavar="SYSTEM=COUNT,...",
+                        help="WARNING below this many satellites of a constellation, e.g. GPS=8,GLONASS=4")
+    stream.add_argument("--satellites-critical", type=satellite_counts, metavar="SYSTEM=COUNT,...",
+                        help="CRITICAL below this many satellites of a constellation")
+    stream.add_argument("--cnr-warning", type=float, metavar="DBHZ",
+                        help="WARNING when the mean C/N0 of all signals is below this")
+    stream.add_argument("--cnr-critical", type=float, metavar="DBHZ",
+                        help="CRITICAL when the mean C/N0 of all signals is below this")
 
     return parser
 
