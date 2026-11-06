@@ -21,7 +21,7 @@ UNKNOWN = 3
 
 STATE_TEXT = {OK: "OK", WARNING: "WARNING", CRITICAL: "CRITICAL", UNKNOWN: "UNKNOWN"}
 
-VERSION = "0.3"
+VERSION = "0.3.1"
 DEFAULT_PORT = 2101
 DEFAULT_TIMEOUT = 10
 DEFAULT_DURATION = 5
@@ -458,6 +458,10 @@ def check_stream(args):
         while True:
             buffer = connection.buffer
             start = buffer.find(b"\xd3")
+            if start != 0:
+                # Other data (e.g. UBX or NMEA a receiver sends along) lies between the frames; a 0xD3 in it
+                # is no broken frame.
+                synced = False
             if start < 0 or len(buffer) < start + 6:
                 if not connection.fill(deadline):
                     break

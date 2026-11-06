@@ -227,6 +227,24 @@ class StreamCheckTests(unittest.TestCase):
         self.assertIn("no C/N0", message)
 
 
+class FramingTests(unittest.TestCase):
+    def test_d3_byte_in_other_data_is_no_checksum_error(self):
+        # UBX and NMEA that a receiver sends along with RTCM, with a 0xD3 that is no frame start
+        ubx = b"\xb5\x62\x01\x06\x04\x00\xd3\x01\x02\x03\x10\x20"
+        nmea = b"$GNRMC,133525.00,A,4820.15,N,01419.36,E*7F\r\n"
+        data = jku0_stream() + ubx + nmea + jku0_stream()
+        state, message, perf = run(data)
+        self.assertEqual(state, plugin.OK, message)
+        self.assertIn("crc_errors=0;;;0", perf)
+
+    def test_broken_frame_right_after_a_good_one_is_counted(self):
+        broken = bytearray(msm(1077, list(range(1, 11)), 40))
+        broken[10] ^= 0xFF
+        state, message, perf = run(jku0_stream() + bytes(broken) + jku0_stream())
+        self.assertEqual(state, plugin.WARNING, message)
+        self.assertIn("1 frame(s) with a wrong checksum", message)
+
+
 class OptionTests(unittest.TestCase):
     def parse(self, *options):
         return plugin.build_parser().parse_args(["stream", "-H", "h", "-m", "M"] + list(options))
